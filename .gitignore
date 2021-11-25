@@ -1,0 +1,5 @@
+# Project exclude paths
+/lightning_demo_mnist/
+/MNIST/
+/uncategorized/
+/wandb/
