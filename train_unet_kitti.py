@@ -2,6 +2,7 @@ from typing import Any, Callable, cast, Dict, Iterable, List, Optional, Tuple, U
 from argparse import ArgumentParser, Namespace
 import torch
 from torch.nn import functional as F
+import torchmetrics
 import pytorch_lightning as pl
 from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.utilities.argparse import from_argparse_args
@@ -11,7 +12,31 @@ import wandb
 import numpy as np
 from cityscape_labels import labels
 
+
+class SegmentMapAccuracy(torchmetrics.Metric):
+    def __init__(self, dist_sync_on_step=False, ignore_index=None):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+
+        self.ignore_index = ignore_index
+        self.add_state("correct", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, preds: torch.Tensor, targets: torch.Tensor):
+        # we need to ignore the the targets
+        if self.ignore_index is not None:
+            valid = targets != self.ignore_index
+            self.correct += torch.count_nonzero(preds[valid] == targets[valid])
+            self.total += targets[valid].numel()
+        else:
+            self.correct += torch.count_nonzero(preds == targets)
+            self.total += targets.numel()
+
+    def compute(self):
+        return self.correct / self.total
+
+
 class_labels =  {label.id: label.name for label in labels}
+
 
 class WandbImagePredCallback(pl.Callback):
     """Logs the input images and output predictions of a module.
@@ -86,6 +111,9 @@ class SemSegment(LightningModule):
             bilinear=self.bilinear,
         )
 
+        self.train_acc = SegmentMapAccuracy(ignore_index=250)
+        self.val_acc = SegmentMapAccuracy(ignore_index=250)
+
     def forward(self, x):
         return self.net(x)
 
@@ -95,8 +123,15 @@ class SemSegment(LightningModule):
         mask = mask.long()
         out = self(img)
         loss_val = F.cross_entropy(out, mask, ignore_index=250)
-        log_dict = {"train_loss": loss_val}
-        return {"loss": loss_val, "log": log_dict, "progress_bar": log_dict}
+        log_dict = {"train_loss": loss_val.item()}
+        return {"loss": loss_val, "log": log_dict, 'preds': out.detach().cpu(), 'targets': mask.detach().cpu(), "progress_bar": log_dict}
+
+    def training_step_end(self, outputs):
+        self.train_acc(torch.argmax(outputs['preds'], dim=1), outputs['targets'])
+        self.log("train/acc_step", self.train_acc)
+
+    def training_epoch_end(self, outputs):
+        self.log("train/acc_epoch", self.train_acc)
 
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
@@ -105,12 +140,18 @@ class SemSegment(LightningModule):
             mask = mask.long()
             out = self(img)
             loss_val = F.cross_entropy(out, mask, ignore_index=250)
-            return {"val_loss": loss_val}
+            return {"val_loss": loss_val, 'preds': out.cpu(), 'targets': mask.cpu()}
+
+    def validation_step_end(self, outputs):
+        with torch.no_grad():
+            self.val_acc(torch.argmax(outputs['preds'], dim=1), outputs['targets'])
+            self.log("val/acc_step", self.val_acc)
 
     def validation_epoch_end(self, outputs):
         with torch.no_grad():
             loss_val = torch.stack([x["val_loss"] for x in outputs]).mean()
             log_dict = {"val_loss": loss_val}
+            self.log("val/acc_epoch", self.val_acc)
             return {"log": log_dict, "val_loss": log_dict["val_loss"], "progress_bar": log_dict}
 
     def configure_optimizers(self):
